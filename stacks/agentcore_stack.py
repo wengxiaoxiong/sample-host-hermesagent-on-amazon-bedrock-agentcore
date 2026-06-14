@@ -78,30 +78,6 @@ class HermesAgentCoreStack(Stack):
             ),
         )
 
-        # Bedrock model invocation.
-        self.execution_role.add_to_policy(
-            iam.PolicyStatement(
-                sid="BedrockInvoke",
-                actions=[
-                    "bedrock:InvokeModel",
-                    "bedrock:InvokeModelWithResponseStream",
-                ],
-                resources=[
-                    f"arn:aws:bedrock:{region}::foundation-model/*",
-                    f"arn:aws:bedrock:*:{account}:inference-profile/*",
-                ],
-            )
-        )
-
-        # Bedrock Guardrails.
-        self.execution_role.add_to_policy(
-            iam.PolicyStatement(
-                sid="BedrockGuardrails",
-                actions=["bedrock:ApplyGuardrail"],
-                resources=[f"arn:aws:bedrock:{region}:{account}:guardrail/*"],
-            )
-        )
-
         # S3 — user files bucket.
         self.bucket.grant_read_write(self.execution_role)
 

@@ -18,6 +18,143 @@ cd "$PROJECT_DIR"
 PHASE="${1:-all}"
 PROJECT_NAME="hermes-agentcore"
 RUNTIME_NAME="hermes_agent"
+HERMES_AGENT_VERSION="${HERMES_AGENT_VERSION:-0.15.2}"
+AGENTCORE_CONFIG_BACKUP=""
+CDK_BOOTSTRAP_QUALIFIER="$(python - <<'PY'
+import json
+from pathlib import Path
+
+config = json.loads(Path("cdk.json").read_text())
+print(config.get("context", {}).get("bootstrap_qualifier", "hmsagt001"))
+PY
+)"
+CDK_BOOTSTRAP_STACK_NAME="$(python - <<'PY'
+import json
+from pathlib import Path
+
+config = json.loads(Path("cdk.json").read_text())
+print(config.get("context", {}).get("bootstrap_stack_name", "CDKToolkitHermes"))
+PY
+)"
+
+load_env() {
+    local env_file=""
+    if [ -f "$PROJECT_DIR/.env" ]; then
+        env_file="$PROJECT_DIR/.env"
+    elif [ -f "$PROJECT_DIR/../.env" ]; then
+        env_file="$PROJECT_DIR/../.env"
+    fi
+
+    if [ -n "$env_file" ]; then
+        info "Loading environment from $env_file"
+        set -a
+        # shellcheck disable=SC1090
+        source "$env_file"
+        set +a
+    fi
+}
+
+restore_agentcore_config() {
+    if [ -n "$AGENTCORE_CONFIG_BACKUP" ] && [ -f "$AGENTCORE_CONFIG_BACKUP" ]; then
+        mv "$AGENTCORE_CONFIG_BACKUP" "$PROJECT_DIR/agentcore/agentcore.json"
+        AGENTCORE_CONFIG_BACKUP=""
+    fi
+    rm -rf "$PROJECT_DIR/agentcore/cdk/cdk.out"
+}
+
+prepare_agentcore_env() {
+    if [ -z "${LITELLM_BASE_URL:-}" ]; then
+        error "LITELLM_BASE_URL is required for Phase 2. Set it in .env."
+        exit 1
+    fi
+    if [ -z "${LITELLM_API_KEY:-}" ]; then
+        error "LITELLM_API_KEY is required for Phase 2. Set it in .env."
+        exit 1
+    fi
+
+    export HERMES_PROVIDER="${HERMES_PROVIDER:-openai}"
+    export HERMES_BASE_URL="${HERMES_BASE_URL:-$LITELLM_BASE_URL}"
+    export OPENAI_API_KEY="${OPENAI_API_KEY:-$LITELLM_API_KEY}"
+    export LITELLM_MODEL="${LITELLM_MODEL:-${HERMES_MODEL:-${MODEL_NAME:-gpt-4o-mini}}}"
+    export HERMES_MODEL="${HERMES_MODEL:-$LITELLM_MODEL}"
+    export WARMUP_MODEL="${WARMUP_MODEL:-$LITELLM_MODEL}"
+
+    AGENTCORE_CONFIG_BACKUP="$(mktemp)"
+    cp "$PROJECT_DIR/agentcore/agentcore.json" "$AGENTCORE_CONFIG_BACKUP"
+    trap restore_agentcore_config EXIT
+
+    python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+path = Path("agentcore/agentcore.json")
+config = json.loads(path.read_text())
+config["runtimes"][0]["envVars"] = [
+    {"name": "HERMES_PROVIDER", "value": os.environ["HERMES_PROVIDER"]},
+    {"name": "LITELLM_BASE_URL", "value": os.environ["LITELLM_BASE_URL"]},
+    {"name": "LITELLM_API_KEY", "value": os.environ["LITELLM_API_KEY"]},
+    {"name": "HERMES_BASE_URL", "value": os.environ["HERMES_BASE_URL"]},
+    {"name": "OPENAI_API_KEY", "value": os.environ["OPENAI_API_KEY"]},
+    {"name": "LITELLM_MODEL", "value": os.environ["LITELLM_MODEL"]},
+    {"name": "HERMES_MODEL", "value": os.environ["HERMES_MODEL"]},
+    {"name": "WARMUP_MODEL", "value": os.environ["WARMUP_MODEL"]},
+]
+path.write_text(json.dumps(config, indent=2) + "\n")
+PY
+    info "Injected LiteLLM runtime envVars into agentcore/agentcore.json for this deployment."
+}
+
+ensure_hermes_agent_source() {
+    if [ -d "$PROJECT_DIR/app/hermes/hermes-agent" ]; then
+        return
+    fi
+
+    if [ -d "$HOME/hermes-agent" ]; then
+        return
+    fi
+
+    info "hermes-agent not found at $HOME/hermes-agent — cloning …"
+    if git clone https://github.com/NousResearch/hermes-agent.git "$HOME/hermes-agent"; then
+        return
+    fi
+
+    warn "GitHub clone failed. Falling back to PyPI source distribution hermes-agent==$HERMES_AGENT_VERSION."
+    TMP_SRC="$(mktemp -d)"
+    python -m pip download \
+        --no-deps \
+        --no-binary=:all: \
+        --dest "$TMP_SRC" \
+        "hermes-agent==$HERMES_AGENT_VERSION"
+
+    HERMES_SDIST="$(find "$TMP_SRC" -maxdepth 1 \( -name 'hermes_agent-*.tar.gz' -o -name 'hermes-agent-*.tar.gz' \) | head -n 1)"
+    if [ -z "$HERMES_SDIST" ]; then
+        error "Could not find downloaded hermes-agent source archive in $TMP_SRC"
+        exit 1
+    fi
+
+    HERMES_SDIST="$HERMES_SDIST" HOME="$HOME" python - <<'PY'
+import os
+import shutil
+import tarfile
+from pathlib import Path
+
+archive = Path(os.environ["HERMES_SDIST"])
+dest = Path(os.environ["HOME"]) / "hermes-agent"
+tmp = archive.parent / "extract"
+tmp.mkdir(parents=True, exist_ok=True)
+with tarfile.open(archive) as tar:
+    tar.extractall(tmp)
+roots = [path for path in tmp.iterdir() if path.is_dir()]
+if not roots:
+    raise SystemExit("source archive did not contain a directory")
+if dest.exists():
+    shutil.rmtree(dest)
+shutil.move(str(roots[0]), dest)
+PY
+    rm -rf "$TMP_SRC"
+    info "Created $HOME/hermes-agent from PyPI source distribution."
+}
 
 # Activate virtual environment if present.
 if [ -f "$PROJECT_DIR/.venv/bin/activate" ]; then
@@ -47,17 +184,21 @@ error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 # --------------------------------------------------------------------------
 phase1() {
     info "=== Phase 1: CDK Foundation Stacks ==="
+    load_env
 
-    # Ensure CDK is bootstrapped.
-    if ! aws cloudformation describe-stacks --stack-name CDKToolkit &>/dev/null; then
-        info "Bootstrapping CDK …"
-        $CDK bootstrap
+    # Ensure this project uses its own CDK bootstrap resources. The default
+    # bootstrap bucket in this account may be shared by other experiments.
+    if ! aws cloudformation describe-stacks --stack-name "$CDK_BOOTSTRAP_STACK_NAME" &>/dev/null; then
+        info "Bootstrapping CDK stack $CDK_BOOTSTRAP_STACK_NAME (qualifier=$CDK_BOOTSTRAP_QUALIFIER) …"
+        $CDK bootstrap \
+            --qualifier "$CDK_BOOTSTRAP_QUALIFIER" \
+            --toolkit-stack-name "$CDK_BOOTSTRAP_STACK_NAME" \
+            --bootstrap-kms-key-id AWS_MANAGED_KEY
     fi
 
     $CDK deploy \
         "${PROJECT_NAME}-vpc" \
         "${PROJECT_NAME}-security" \
-        "${PROJECT_NAME}-guardrails" \
         "${PROJECT_NAME}-agentcore" \
         "${PROJECT_NAME}-observability" \
         --require-approval never
@@ -70,6 +211,8 @@ phase1() {
 # --------------------------------------------------------------------------
 phase2() {
     info "=== Phase 2: AgentCore Runtime (build + deploy) ==="
+    load_env
+    prepare_agentcore_env
 
     # Check toolkit is installed.
     if ! command -v agentcore &>/dev/null; then
@@ -97,10 +240,7 @@ TARGETS
 
     # Copy hermes-agent source into the app/hermes/ Docker build context.
     if [ ! -d "$PROJECT_DIR/app/hermes/hermes-agent" ]; then
-        if [ ! -d "$HOME/hermes-agent" ]; then
-            info "hermes-agent not found at $HOME/hermes-agent — cloning …"
-            git clone https://github.com/NousResearch/hermes-agent.git "$HOME/hermes-agent"
-        fi
+        ensure_hermes_agent_source
         info "Copying hermes-agent source into app/hermes/ for Docker build …"
         rsync -a --exclude='.git' --exclude='node_modules' --exclude='__pycache__' \
             "$HOME/hermes-agent/" "$PROJECT_DIR/app/hermes/hermes-agent/"
@@ -119,31 +259,55 @@ TARGETS
     info "Extracting runtime IDs …"
     # Strip ANSI escape sequences (agentcore CLI may emit cursor control codes).
     STATUS_JSON=$(agentcore status --json 2>/dev/null | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' || echo "{}")
-    RUNTIME_ARN=$(echo "$STATUS_JSON" | jq -r '
-        .resources[0].identifier //
-        .runtimes[0].agentRuntimeArn //
-        .runtimes[0].runtimeArn //
-        .agentRuntimeArn //
-        .runtimeArn //
-        empty' 2>/dev/null || echo "")
+    RUNTIME_ARN=$(STATUS_JSON="$STATUS_JSON" python - <<'PY'
+import json
+import os
+
+data = json.loads(os.environ.get("STATUS_JSON") or "{}")
+candidates = [
+    data.get("resources", [{}])[0].get("identifier") if data.get("resources") else "",
+    data.get("runtimes", [{}])[0].get("agentRuntimeArn") if data.get("runtimes") else "",
+    data.get("runtimes", [{}])[0].get("runtimeArn") if data.get("runtimes") else "",
+    data.get("agentRuntimeArn"),
+    data.get("runtimeArn"),
+]
+print(next((value for value in candidates if value), ""))
+PY
+)
     # Extract qualifier from the runtime ARN tail (e.g. "hermes_hermes-55EPNeG2QF")
-    QUALIFIER=$(echo "$STATUS_JSON" | jq -r '
-        .resources[0].identifier //
-        .runtimes[0].agentRuntimeId //
-        .runtimes[0].qualifier //
-        .qualifier //
-        .endpointId //
-        empty' 2>/dev/null | sed 's|.*/||' || echo "")
+    QUALIFIER=$(STATUS_JSON="$STATUS_JSON" python - <<'PY' | sed 's|.*/||'
+import json
+import os
+
+data = json.loads(os.environ.get("STATUS_JSON") or "{}")
+candidates = [
+    data.get("resources", [{}])[0].get("identifier") if data.get("resources") else "",
+    data.get("runtimes", [{}])[0].get("agentRuntimeId") if data.get("runtimes") else "",
+    data.get("runtimes", [{}])[0].get("qualifier") if data.get("runtimes") else "",
+    data.get("qualifier"),
+    data.get("endpointId"),
+]
+print(next((value for value in candidates if value), ""))
+PY
+)
 
     if [ -n "$RUNTIME_ARN" ]; then
         info "Runtime ARN:  $RUNTIME_ARN"
         info "Qualifier:    $QUALIFIER"
 
         # Update cdk.json with runtime IDs.
-        TMP=$(mktemp)
-        jq ".context.agentcore_runtime_arn = \"$RUNTIME_ARN\" | \
-            .context.agentcore_qualifier = \"$QUALIFIER\"" \
-            cdk.json > "$TMP" && mv "$TMP" cdk.json
+        RUNTIME_ARN="$RUNTIME_ARN" QUALIFIER="$QUALIFIER" python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+path = Path("cdk.json")
+config = json.loads(path.read_text())
+config.setdefault("context", {})
+config["context"]["agentcore_runtime_arn"] = os.environ["RUNTIME_ARN"]
+config["context"]["agentcore_qualifier"] = os.environ["QUALIFIER"]
+path.write_text(json.dumps(config, indent=2) + "\n")
+PY
 
         info "cdk.json updated with runtime IDs."
     else
@@ -152,6 +316,8 @@ TARGETS
     fi
 
     info "Phase 2 complete."
+    restore_agentcore_config
+    trap - EXIT
 }
 
 # --------------------------------------------------------------------------
@@ -159,9 +325,17 @@ TARGETS
 # --------------------------------------------------------------------------
 phase3() {
     info "=== Phase 3: CDK Dependent Stacks ==="
+    load_env
 
     # Verify runtime IDs are set.
-    RUNTIME_ARN=$(jq -r '.context.agentcore_runtime_arn // empty' cdk.json)
+    RUNTIME_ARN=$(python - <<'PY'
+import json
+from pathlib import Path
+
+config = json.loads(Path("cdk.json").read_text())
+print(config.get("context", {}).get("agentcore_runtime_arn", ""))
+PY
+)
     if [ -z "$RUNTIME_ARN" ]; then
         warn "agentcore_runtime_arn not set in cdk.json — Lambda will not be able to invoke AgentCore."
         warn "Run Phase 2 first, or set the values manually."
@@ -195,9 +369,17 @@ phase3() {
 # --------------------------------------------------------------------------
 phase4() {
     info "=== Phase 4: ECS Gateway (WeChat + Feishu) ==="
+    load_env
 
     # Verify runtime ARN is set.
-    RUNTIME_ARN=$(jq -r '.context.agentcore_runtime_arn // empty' cdk.json)
+    RUNTIME_ARN=$(python - <<'PY'
+import json
+from pathlib import Path
+
+config = json.loads(Path("cdk.json").read_text())
+print(config.get("context", {}).get("agentcore_runtime_arn", ""))
+PY
+)
     if [ -z "$RUNTIME_ARN" ]; then
         error "agentcore_runtime_arn not set in cdk.json. Run Phase 2 first."
         exit 1

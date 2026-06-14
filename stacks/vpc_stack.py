@@ -58,7 +58,6 @@ class HermesVpcStack(Stack):
             self.vpc.add_gateway_endpoint(f"{name}Endpoint", service=service)
 
         interface_services = [
-            ("Bedrock", ec2.InterfaceVpcEndpointAwsService.BEDROCK_RUNTIME),
             ("SecretsManager", ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER),
             ("STS", ec2.InterfaceVpcEndpointAwsService.STS),
             ("ECR", ec2.InterfaceVpcEndpointAwsService.ECR),

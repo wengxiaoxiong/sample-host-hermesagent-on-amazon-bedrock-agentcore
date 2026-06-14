@@ -49,7 +49,7 @@ class WorkspaceSync:
         self.sync_interval = int(
             os.environ.get("WORKSPACE_SYNC_INTERVAL", "300"),
         )
-        self._s3: Any = boto3.client("s3")
+        self._s3: Any = None
         self._stop = threading.Event()
         self._save_lock = threading.Lock()
 
@@ -68,7 +68,8 @@ class WorkspaceSync:
         count = 0
 
         try:
-            paginator = self._s3.get_paginator("list_objects_v2")
+            s3 = self._s3_client()
+            paginator = s3.get_paginator("list_objects_v2")
             for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
                 for obj in page.get("Contents", []):
                     key: str = obj["Key"]
@@ -77,7 +78,7 @@ class WorkspaceSync:
                         continue
                     local_path = self.workspace / relative
                     local_path.parent.mkdir(parents=True, exist_ok=True)
-                    self._s3.download_file(self.bucket, key, str(local_path))
+                    s3.download_file(self.bucket, key, str(local_path))
                     count += 1
         except ClientError as exc:
             logger.warning("S3 restore error: %s", exc)
@@ -101,13 +102,14 @@ class WorkspaceSync:
         with self._save_lock:
             prefix = f"{namespace}/.hermes/"
             count = 0
+            s3 = self._s3_client()
 
             # Hot-copy any SQLite databases first.
             for db_file in self.workspace.glob("*.db"):
                 bak = db_file.with_suffix(".db.s3bak")
                 try:
                     self._sqlite_backup(db_file, bak)
-                    self._s3.upload_file(str(bak), self.bucket, f"{prefix}{db_file.name}")
+                    s3.upload_file(str(bak), self.bucket, f"{prefix}{db_file.name}")
                     bak.unlink(missing_ok=True)
                     count += 1
                 except Exception as exc:
@@ -124,7 +126,7 @@ class WorkspaceSync:
                 if path.suffix == ".db":
                     continue
                 try:
-                    self._s3.upload_file(str(path), self.bucket, f"{prefix}{relative}")
+                    s3.upload_file(str(path), self.bucket, f"{prefix}{relative}")
                     count += 1
                 except Exception as exc:
                     logger.error("Upload failed (%s): %s", relative, exc)
@@ -164,6 +166,11 @@ class WorkspaceSync:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _s3_client(self) -> Any:
+        if self._s3 is None:
+            self._s3 = boto3.client("s3")
+        return self._s3
 
     @staticmethod
     def _should_skip(relative: str) -> bool:

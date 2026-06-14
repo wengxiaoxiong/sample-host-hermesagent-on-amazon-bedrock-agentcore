@@ -11,8 +11,9 @@
 #   1. Phase 4 CDK stack   (ECS gateway — WeChat + Feishu)
 #   2. Phase 3 CDK stacks  (router, cron, token-monitoring)
 #   3. Phase 2 AgentCore   (AgentCore-hermes-default stack + runtime)
-#   4. Phase 1 CDK stacks  (observability, agentcore, guardrails, security, vpc)
-#   5. Retained resources   (S3, DynamoDB, KMS, Cognito — skipped by cdk destroy)
+#   4. Phase 1 CDK stacks  (observability, agentcore, security, vpc)
+#   5. Project bootstrap    (isolated CDKToolkitHermes stack)
+#   6. Retained resources   (S3, DynamoDB, KMS, Cognito — skipped by cdk destroy)
 # --------------------------------------------------------------------------
 set -euo pipefail
 
@@ -22,6 +23,22 @@ cd "$PROJECT_DIR"
 
 MODE="${1:-interactive}"
 PROJECT_NAME="hermes-agentcore"
+CDK_BOOTSTRAP_QUALIFIER="$(python - <<'PY'
+import json
+from pathlib import Path
+
+config = json.loads(Path("cdk.json").read_text())
+print(config.get("context", {}).get("bootstrap_qualifier", "hmsagt001"))
+PY
+)"
+CDK_BOOTSTRAP_STACK_NAME="$(python - <<'PY'
+import json
+from pathlib import Path
+
+config = json.loads(Path("cdk.json").read_text())
+print(config.get("context", {}).get("bootstrap_stack_name", "CDKToolkitHermes"))
+PY
+)"
 
 # Activate virtual environment if present.
 if [ -f "$PROJECT_DIR/.venv/bin/activate" ]; then
@@ -48,6 +65,23 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 step()  { echo -e "${CYAN}[STEP]${NC} $*"; }
 
+load_env() {
+    local env_file=""
+    if [ -f "$PROJECT_DIR/.env" ]; then
+        env_file="$PROJECT_DIR/.env"
+    elif [ -f "$PROJECT_DIR/../.env" ]; then
+        env_file="$PROJECT_DIR/../.env"
+    fi
+
+    if [ -n "$env_file" ]; then
+        info "Loading environment from $env_file"
+        set -a
+        # shellcheck disable=SC1090
+        source "$env_file"
+        set +a
+    fi
+}
+
 DRY_RUN=false
 FORCE=false
 
@@ -61,7 +95,9 @@ case "$MODE" in
         ;;
 esac
 
-REGION=$(aws configure get region 2>/dev/null || echo "us-west-2")
+load_env
+
+REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || echo "us-west-2")}}"
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "unknown")
 
 # --------------------------------------------------------------------------
@@ -103,9 +139,9 @@ for STACK in \
     "AgentCore-hermes-default" \
     "${PROJECT_NAME}-observability" \
     "${PROJECT_NAME}-agentcore" \
-    "${PROJECT_NAME}-guardrails" \
     "${PROJECT_NAME}-security" \
-    "${PROJECT_NAME}-vpc"; do
+    "${PROJECT_NAME}-vpc" \
+    "$CDK_BOOTSTRAP_STACK_NAME"; do
     if stack_exists "$STACK"; then
         echo -e "  ${RED}✗${NC} $STACK"
     else
@@ -114,8 +150,13 @@ for STACK in \
 done
 
 echo ""
-info "Retained resources to delete manually:"
+info "ECR repositories to delete or empty if present:"
+echo "  - ECR:      hermes/hermes"
+echo "  - ECR:      cdk-${CDK_BOOTSTRAP_QUALIFIER}-container-assets-${ACCOUNT}-${REGION}"
+echo ""
+info "Additional retained resources to clean:"
 echo "  - S3:       ${PROJECT_NAME}-user-files-${ACCOUNT}-${REGION}"
+echo "  - S3:       cdk-${CDK_BOOTSTRAP_QUALIFIER}-assets-${ACCOUNT}-${REGION}"
 echo "  - DynamoDB: ${PROJECT_NAME}-identity"
 echo "  - KMS:      alias/${PROJECT_NAME}"
 echo "  - Cognito:  ${PROJECT_NAME}-users"
@@ -140,7 +181,7 @@ fi
 # Step 1: Destroy Phase 4 CDK stack (ECS Gateway)
 # --------------------------------------------------------------------------
 
-step "1/5  Destroying Phase 4 stack (ECS gateway) …"
+step "1/6  Destroying Phase 4 stack (ECS gateway) …"
 
 if stack_exists "${PROJECT_NAME}-gateway"; then
     $CDK destroy "${PROJECT_NAME}-gateway" --force 2>/dev/null \
@@ -154,7 +195,7 @@ fi
 # Step 2: Destroy Phase 3 CDK stacks
 # --------------------------------------------------------------------------
 
-step "2/5  Destroying Phase 3 stacks (router, cron, token-monitoring) …"
+step "2/6  Destroying Phase 3 stacks (router, cron, token-monitoring) …"
 
 $CDK destroy \
     "${PROJECT_NAME}-token-monitoring" \
@@ -168,7 +209,7 @@ info "Phase 3 stacks destroyed."
 # Step 3: Destroy Phase 2 AgentCore runtime
 # --------------------------------------------------------------------------
 
-step "3/5  Destroying Phase 2 (AgentCore runtime) …"
+step "3/6  Destroying Phase 2 (AgentCore runtime) …"
 
 # The agentcore CLI does not have a destroy command.
 # The runtime is deployed as a CloudFormation stack by the toolkit CDK.
@@ -186,7 +227,7 @@ else
 fi
 
 # Clean up ECR repository if it was created by the toolkit.
-ECR_REPO=$(aws ecr describe-repositories --query "repositories[?contains(repositoryName, 'hermes')].repositoryName" --output text 2>/dev/null || echo "")
+ECR_REPO=$(aws ecr describe-repositories --query "repositories[?repositoryName=='${PROJECT_NAME}-gateway' || repositoryName=='hermes/hermes' || repositoryName=='hermes' || repositoryName=='hermes_agent' || repositoryName=='agentcore-hermes'].repositoryName" --output text 2>/dev/null || echo "")
 if [ -n "$ECR_REPO" ]; then
     for repo in $ECR_REPO; do
         info "Deleting ECR repository: $repo"
@@ -201,13 +242,12 @@ info "Phase 2 resources destroyed."
 # Step 4: Destroy Phase 1 CDK stacks
 # --------------------------------------------------------------------------
 
-step "4/5  Destroying Phase 1 stacks (observability, agentcore, guardrails, security, vpc) …"
+step "4/6  Destroying Phase 1 stacks (observability, agentcore, security, vpc) …"
 
 # Destroy in reverse dependency order.
 $CDK destroy \
     "${PROJECT_NAME}-observability" \
     "${PROJECT_NAME}-agentcore" \
-    "${PROJECT_NAME}-guardrails" \
     "${PROJECT_NAME}-security" \
     "${PROJECT_NAME}-vpc" \
     --force 2>/dev/null || warn "Some Phase 1 stacks may have already been deleted."
@@ -215,28 +255,89 @@ $CDK destroy \
 info "Phase 1 stacks destroyed."
 
 # --------------------------------------------------------------------------
-# Step 4: Clean up retained resources
+# Step 5: Destroy isolated CDK bootstrap stack
 # --------------------------------------------------------------------------
 
-step "5/5  Cleaning up retained resources (RemovalPolicy.RETAIN) …"
+step "5/6  Destroying isolated CDK bootstrap stack …"
+
+BOOTSTRAP_BUCKET="cdk-${CDK_BOOTSTRAP_QUALIFIER}-assets-${ACCOUNT}-${REGION}"
+BOOTSTRAP_ECR_REPO="cdk-${CDK_BOOTSTRAP_QUALIFIER}-container-assets-${ACCOUNT}-${REGION}"
+if aws s3api head-bucket --bucket "$BOOTSTRAP_BUCKET" 2>/dev/null; then
+    info "Emptying bootstrap asset bucket: $BOOTSTRAP_BUCKET (including versions) …"
+    BUCKET="$BOOTSTRAP_BUCKET" python - <<'PY'
+import os
+import boto3
+
+bucket = os.environ["BUCKET"]
+s3 = boto3.client("s3")
+paginator = s3.get_paginator("list_object_versions")
+batch = []
+
+def flush() -> None:
+    global batch
+    if batch:
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+        batch = []
+
+for page in paginator.paginate(Bucket=bucket):
+    for item in page.get("Versions", []) + page.get("DeleteMarkers", []):
+        batch.append({"Key": item["Key"], "VersionId": item["VersionId"]})
+        if len(batch) == 1000:
+            flush()
+flush()
+PY
+fi
+
+if aws ecr describe-repositories --repository-names "$BOOTSTRAP_ECR_REPO" >/dev/null 2>&1; then
+    info "Emptying bootstrap ECR repository: $BOOTSTRAP_ECR_REPO"
+    IMAGE_IDS=$(aws ecr list-images --repository-name "$BOOTSTRAP_ECR_REPO" --query "imageIds[]" --output json 2>/dev/null || echo "[]")
+    if [ "$IMAGE_IDS" != "[]" ]; then
+        aws ecr batch-delete-image --repository-name "$BOOTSTRAP_ECR_REPO" --image-ids "$IMAGE_IDS" >/dev/null 2>&1 \
+            || warn "Could not empty bootstrap ECR repository: $BOOTSTRAP_ECR_REPO"
+    fi
+fi
+
+if stack_exists "$CDK_BOOTSTRAP_STACK_NAME"; then
+    info "Deleting CloudFormation stack: $CDK_BOOTSTRAP_STACK_NAME"
+    aws cloudformation delete-stack --stack-name "$CDK_BOOTSTRAP_STACK_NAME"
+    aws cloudformation wait stack-delete-complete --stack-name "$CDK_BOOTSTRAP_STACK_NAME" 2>/dev/null \
+        || warn "Bootstrap stack deletion wait timed out. Check the console for status."
+else
+    info "$CDK_BOOTSTRAP_STACK_NAME already deleted."
+fi
+
+# --------------------------------------------------------------------------
+# Step 6: Clean up retained resources
+# --------------------------------------------------------------------------
+
+step "6/6  Cleaning up retained resources (RemovalPolicy.RETAIN) …"
 
 # 4a. S3 bucket — must empty before deletion.
 BUCKET="${PROJECT_NAME}-user-files-${ACCOUNT}-${REGION}"
 if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
     info "Emptying S3 bucket: $BUCKET (including versions) …"
-    aws s3api list-object-versions --bucket "$BUCKET" --output json \
-        --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' 2>/dev/null | \
-        jq -c 'select(.Objects != null and (.Objects | length) > 0)' | \
-    while read -r batch; do
-        aws s3api delete-objects --bucket "$BUCKET" --delete "$batch" >/dev/null 2>&1
-    done
-    # Also delete delete-markers.
-    aws s3api list-object-versions --bucket "$BUCKET" --output json \
-        --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' 2>/dev/null | \
-        jq -c 'select(.Objects != null and (.Objects | length) > 0)' | \
-    while read -r batch; do
-        aws s3api delete-objects --bucket "$BUCKET" --delete "$batch" >/dev/null 2>&1
-    done
+    BUCKET="$BUCKET" python - <<'PY'
+import os
+import boto3
+
+bucket = os.environ["BUCKET"]
+s3 = boto3.client("s3")
+paginator = s3.get_paginator("list_object_versions")
+batch = []
+
+def flush() -> None:
+    global batch
+    if batch:
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+        batch = []
+
+for page in paginator.paginate(Bucket=bucket):
+    for item in page.get("Versions", []) + page.get("DeleteMarkers", []):
+        batch.append({"Key": item["Key"], "VersionId": item["VersionId"]})
+        if len(batch) == 1000:
+            flush()
+flush()
+PY
     info "Deleting S3 bucket: $BUCKET"
     aws s3 rb "s3://$BUCKET" 2>/dev/null || warn "Could not delete bucket $BUCKET"
 else

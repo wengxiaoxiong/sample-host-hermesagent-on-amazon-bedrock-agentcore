@@ -1,13 +1,12 @@
-"""Hermes Agent on Amazon Bedrock AgentCore.
+"""Hermes Agent on AgentCore with an OpenAI-compatible model API.
 
 Uses the bedrock-agentcore SDK (BedrockAgentCoreApp) which handles the
 /ping and /invocations HTTP contract automatically.
 
 Architecture:
-  - Monkey-patches the anthropic SDK so that any Anthropic() client
-    creation returns an AnthropicBedrock() client instead — this
-    transparently routes all API calls through Bedrock with SigV4 auth.
-  - hermes-agent code is unmodified; it thinks it's talking to Anthropic.
+  - Keeps AgentCore as the runtime host.
+  - Routes model calls to the user-provided OpenAI-compatible endpoint via
+    hermes-agent provider/base_url settings.
 """
 
 from __future__ import annotations
@@ -19,16 +18,6 @@ import sys
 import traceback
 from typing import Any
 
-# ---------------------------------------------------------------------------
-# Monkey-patch anthropic SDK BEFORE importing hermes-agent.
-# This makes all Anthropic() client creation use Bedrock SigV4 auth.
-# ---------------------------------------------------------------------------
-
-import httpx  # noqa: E402
-import anthropic  # noqa: E402
-
-_OrigAnthropic = anthropic.Anthropic
-
 
 def _get_region() -> str:
     return (
@@ -37,34 +26,6 @@ def _get_region() -> str:
         or "us-west-2"
     )
 
-
-class _PatchedAnthropic:
-    """Drop-in replacement for anthropic.Anthropic that uses Bedrock."""
-
-    _bedrock_client = None
-
-    def __new__(cls, *args, **kwargs):
-        # If called with a real Anthropic API key, use original client.
-        api_key = kwargs.get("api_key", "")
-        if api_key and api_key.startswith("sk-ant-"):
-            return _OrigAnthropic(*args, **kwargs)
-
-        # Otherwise, route through Bedrock.
-        if cls._bedrock_client is None:
-            region = _get_region()
-            client = anthropic.AnthropicBedrock(
-                aws_region=region,
-                timeout=httpx.Timeout(600.0, connect=10.0),
-            )
-
-            cls._bedrock_client = client
-        return cls._bedrock_client
-
-
-# Apply the patch.
-anthropic.Anthropic = _PatchedAnthropic  # type: ignore[misc]
-
-# ---------------------------------------------------------------------------
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp  # noqa: E402
 
@@ -94,27 +55,40 @@ def get_or_create_agent():
     os.environ.setdefault("AWS_DEFAULT_REGION", region)
     os.environ.setdefault("AWS_REGION", region)
 
+    base_url = os.environ.get("LITELLM_BASE_URL") or os.environ.get("HERMES_BASE_URL")
+    api_key = os.environ.get("LITELLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    model = (
+        os.environ.get("LITELLM_MODEL")
+        or os.environ.get("HERMES_MODEL")
+        or os.environ.get("MODEL_NAME")
+        or "gpt-4o-mini"
+    )
+    provider = os.environ.get("HERMES_PROVIDER", "openai")
+
+    if not base_url:
+        raise RuntimeError("LITELLM_BASE_URL or HERMES_BASE_URL must be set")
+    if not api_key:
+        raise RuntimeError("LITELLM_API_KEY or OPENAI_API_KEY must be set")
+
+    os.environ.setdefault("OPENAI_API_KEY", api_key)
+
     from run_agent import AIAgent
-
-    # Patch the class method BEFORE creating the agent instance.
-    # This ensures preserve_dots=True during __init__ normalization.
-    AIAgent._anthropic_preserve_dots = lambda self: True
-
-    # Use Bedrock model ID directly. The monkey-patched anthropic SDK
-    # routes everything through Bedrock automatically.
-    model = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-6")
 
     _agent = AIAgent(
         model=model,
-        provider="anthropic",
+        provider=provider,
         quiet_mode=True,
+        base_url=base_url,
+        api_key=api_key,
     )
-    # Force-restore the dotted Bedrock model ID — hermes-agent's __init__
-    # normalises dots to dashes (us.anthropic... → us-anthropic...) which
-    # Bedrock rejects as an invalid model identifier.
-    _agent.model = model
 
-    log.info("hermes-agent ready (model=%s, region=%s, backend=bedrock)", model, region)
+    log.info(
+        "hermes-agent ready (model=%s, provider=%s, base_url=%s, region=%s)",
+        model,
+        provider,
+        base_url,
+        region,
+    )
     return _agent
 
 

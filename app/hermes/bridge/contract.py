@@ -245,9 +245,23 @@ def _init_full_agent() -> None:
 
         from run_agent import AIAgent  # noqa: WPS433
 
-        model = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-sonnet-4-6-v1")
-        provider = os.environ.get("HERMES_PROVIDER", "anthropic")
-        base_url = os.environ.get("HERMES_BASE_URL", "")
+        model = (
+            os.environ.get("LITELLM_MODEL")
+            or os.environ.get("HERMES_MODEL")
+            or os.environ.get("MODEL_NAME")
+            or "gpt-4o-mini"
+        )
+        provider = os.environ.get("HERMES_PROVIDER", "openai")
+        base_url = os.environ.get("LITELLM_BASE_URL") or os.environ.get(
+            "HERMES_BASE_URL",
+            "",
+        )
+        api_key = os.environ.get("LITELLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        if not base_url:
+            raise RuntimeError("LITELLM_BASE_URL or HERMES_BASE_URL must be set")
+        if not api_key:
+            raise RuntimeError("LITELLM_API_KEY or OPENAI_API_KEY must be set")
+        os.environ.setdefault("OPENAI_API_KEY", api_key)
 
         kwargs: dict[str, Any] = {
             "model": model,
@@ -257,10 +271,17 @@ def _init_full_agent() -> None:
             kwargs["provider"] = provider
         if base_url:
             kwargs["base_url"] = base_url
+        if api_key:
+            kwargs["api_key"] = api_key
 
         S.agent = AIAgent(**kwargs)
         S.agent_ready = True
-        logger.info("Full hermes-agent ready (model=%s)", model)
+        logger.info(
+            "Full hermes-agent ready (model=%s, provider=%s, base_url=%s)",
+            model,
+            provider,
+            base_url,
+        )
     except Exception:
         logger.error("Failed to load full hermes-agent:\n%s", traceback.format_exc())
 

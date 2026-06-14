@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { AgentCoreStack } from '../lib/cdk-stack';
 import { ConfigIO, type AwsDeploymentTarget } from '@aws/agentcore-cdk';
-import { App, type Environment } from 'aws-cdk-lib';
+import { App, DefaultStackSynthesizer, type Environment } from 'aws-cdk-lib';
 import * as path from 'path';
 import * as fs from 'fs';
 
@@ -24,6 +24,7 @@ async function main() {
   // Config root is parent of cdk/ directory. The CLI sets process.cwd() to agentcore/cdk/.
   const configRoot = path.resolve(process.cwd(), '..');
   const configIO = new ConfigIO({ baseDir: configRoot });
+  const bootstrapQualifier = 'hmsagt001';
 
   const spec = await configIO.readProjectSpec();
   const targets = await configIO.readAWSDeploymentTargets();
@@ -74,6 +75,9 @@ async function main() {
       mcpSpec,
       credentials,
       env,
+      synthesizer: new DefaultStackSynthesizer({
+        qualifier: bootstrapQualifier,
+      }),
       description: `AgentCore stack for ${spec.name} deployed to ${target.name} (${target.region})`,
       tags: {
         'agentcore:project-name': spec.name,

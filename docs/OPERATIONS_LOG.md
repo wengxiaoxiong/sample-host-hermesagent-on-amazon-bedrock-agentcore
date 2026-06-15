@@ -446,6 +446,10 @@ aws bedrock-agentcore invoke-agent-runtime \
   --runtime-user-id e2e-fmcg-20260615153536 \
   --runtime-session-id session-e2e-fmcg-20260615153536-c-0000000000000000000003 \
   --payload '{"userId":"e2e-fmcg-20260615153536",...}'
+aws bedrock-agentcore stop-runtime-session \
+  --runtime-session-id session-e2e-beauty-20260615153536-b-0000000000000000000002
+aws bedrock-agentcore stop-runtime-session \
+  --runtime-session-id session-e2e-fmcg-20260615153536-c-0000000000000000000003
 aws logs filter-log-events \
   --log-group-name /aws/bedrock-agentcore/runtimes/hermes_hermes-5ddzSXBy8T-DEFAULT \
   --filter-pattern '"e2e-fmcg-20260615153536"'
@@ -461,6 +465,7 @@ Result:
 - Cross-user workspace isolation passed in both directions.
 - No `Workspace already initialized`, `Agent error`, or `Upload failed` log
   entries were found in the validation window.
+- All runtime sessions used for the validation were stopped after the checks.
 
 Evidence:
 

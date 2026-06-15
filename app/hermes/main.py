@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import sys
+import threading
 import traceback
+from pathlib import Path
 from typing import Any
 
 
@@ -38,6 +41,68 @@ log = app.logger
 # ---------------------------------------------------------------------------
 
 _agent = None
+_workspace_sync = None
+_workspace_namespace = ""
+_workspace_lock = threading.Lock()
+
+
+def _derive_workspace_namespace(payload: dict[str, Any], context: Any) -> str:
+    """Return a stable S3 prefix namespace for this invocation."""
+    candidates = [
+        payload.get("userId"),
+        payload.get("user_id"),
+        payload.get("actorId"),
+        payload.get("actor_id"),
+        getattr(context, "runtime_user_id", None),
+        getattr(context, "runtimeUserId", None),
+        getattr(context, "user_id", None),
+    ]
+    for candidate in candidates:
+        if candidate:
+            raw = str(candidate)
+            namespace = re.sub(r"[^A-Za-z0-9._=-]+", "_", raw).strip("._-")
+            if namespace:
+                return namespace[:128]
+    return "agentcore-default"
+
+
+def _ensure_workspace(namespace: str) -> None:
+    """Restore and start S3 sync for the namespace, if configured."""
+    global _workspace_namespace, _workspace_sync
+
+    bucket = os.environ.get("S3_BUCKET", "")
+    if not bucket:
+        return
+
+    with _workspace_lock:
+        if _workspace_sync is not None:
+            if _workspace_namespace != namespace:
+                raise RuntimeError(
+                    "Workspace already initialized for "
+                    f"{_workspace_namespace}; refusing to serve {namespace} "
+                    "in the same container",
+                )
+            return
+
+        from bridge.workspace_sync import WorkspaceSync
+
+        sync = WorkspaceSync()
+        sync.restore(namespace)
+        workspace = Path(os.environ.get("WORKSPACE_PATH", "/mnt/workspace/.hermes"))
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / ".workspace_namespace").write_text(namespace + "\n")
+        sync.start_periodic_save(namespace)
+        _workspace_sync = sync
+        _workspace_namespace = namespace
+        os.environ["AGENTCORE_USER_NAMESPACE"] = namespace
+        log.info("Workspace sync initialised (bucket=%s, ns=%s)", bucket, namespace)
+
+
+def _save_workspace() -> None:
+    """Persist the current workspace when S3 sync has been initialised."""
+    if _workspace_sync is None or not _workspace_namespace:
+        return
+    _workspace_sync.save(_workspace_namespace)
 
 
 def get_or_create_agent():
@@ -97,7 +162,11 @@ def get_or_create_agent():
 # ---------------------------------------------------------------------------
 
 def _sigterm_handler(signum: int, frame: Any) -> None:
-    log.info("SIGTERM received — shutting down")
+    log.info("SIGTERM received — saving workspace and shutting down")
+    try:
+        _save_workspace()
+    except Exception as exc:
+        log.error("Workspace save failed during shutdown: %s", exc)
     sys.exit(0)
 
 
@@ -111,12 +180,14 @@ async def invoke(payload, context):
     prompt = payload.get("prompt", "")
     channel = payload.get("channel", "agentcore")
     message = payload.get("message", prompt)
+    namespace = _derive_workspace_namespace(payload, context)
 
     if not message or not message.strip():
         yield ""
         return
 
     try:
+        _ensure_workspace(namespace)
         agent = get_or_create_agent()
 
         system_extra = f"The user is contacting you via {channel}."
@@ -136,6 +207,11 @@ async def invoke(payload, context):
     except Exception as exc:
         log.error("Agent error: %s\n%s", exc, traceback.format_exc())
         yield f"Sorry, an error occurred: {exc}"
+    finally:
+        try:
+            _save_workspace()
+        except Exception as exc:
+            log.error("Workspace save failed after invocation: %s", exc)
 
 
 # ---------------------------------------------------------------------------

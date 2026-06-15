@@ -135,6 +135,10 @@ def test_save_uploads_files(sync, tmp_workspace):
     ]
     assert any("MEMORY.md" in k for k in uploaded_keys)
     assert any("test.md" in k for k in uploaded_keys)
+    assert any(".workspace_namespace" in k for k in uploaded_keys)
+    assert any("workspace_namespace.txt" in k for k in uploaded_keys)
+    assert (tmp_workspace / ".workspace_namespace").read_text() == "user123\n"
+    assert (tmp_workspace / "workspace_namespace.txt").read_text() == "user123\n"
     # Log file should NOT be uploaded.
     assert not any("agent.log" in k for k in uploaded_keys)
 

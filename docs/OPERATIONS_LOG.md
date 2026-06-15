@@ -339,3 +339,68 @@ Follow-up:
 - Actual deletion remains a separate approval boundary. Run
   `./scripts/teardown.sh` for interactive cleanup or
   `./scripts/teardown.sh --force` only after explicit approval.
+
+## 2026-06-15 Workspace Restore/Save Verified
+
+Date: 2026-06-15 11:32-11:59 CST
+Operator: Codex
+AWS account: `873478945193`
+AWS region: `us-east-1`
+Git branch: `codex/phase12-litellm-agentcore`
+
+Commands:
+
+```bash
+.venv/bin/python -m pytest -q
+bash -n scripts/deploy.sh scripts/teardown.sh
+git diff --check
+npm run build
+./scripts/deploy.sh phase2
+aws bedrock-agentcore invoke-agent-runtime --region us-east-1 --agent-runtime-arn arn:aws:bedrock-agentcore:us-east-1:873478945193:runtime/hermes_hermes-5ddzSXBy8T ...
+agentcore logs --runtime hermes --since 5m --query 'Workspace restore complete'
+agentcore logs --runtime hermes --since 2m --query 'Workspace save complete'
+aws iam get-role-policy --role-name AgentCore-hermes-default-ApplicationAgentHermesRunt-if52C9YxJTzb --policy-name ApplicationAgentHermesRuntimeExecutionRoleDefaultPolicy761A8EC5
+```
+
+Result:
+
+- Added per-user workspace namespace derivation to `app/hermes/main.py`.
+- Runtime now restores workspace from S3 before agent creation, starts periodic
+  save, and saves again after each invocation and on SIGTERM.
+- The runtime refuses to serve a different namespace in an already-initialized
+  container to avoid cross-user workspace mixing.
+- `scripts/deploy.sh` now injects `S3_BUCKET`, `WORKSPACE_PATH`, and
+  `WORKSPACE_SYNC_INTERVAL` into AgentCore runtime env vars for Phase 2.
+- AgentCore runtime role policy now includes S3 object permissions for
+  `hermes-agentcore-user-files-873478945193-us-east-1` and KMS permissions for
+  the bucket encryption key.
+- `WorkspaceSync.save()` writes both `.workspace_namespace` and
+  `workspace_namespace.txt` as explicit verification markers.
+
+Evidence:
+
+- Initial live save attempts reached the runtime but failed on S3 permissions:
+  first `s3:ListBucket`, then `kms:GenerateDataKey` for the bucket KMS key.
+- After IAM/KMS policy fixes, a new user invoke returned `data: "ok"`.
+- S3 contained the expected per-user objects:
+  - `.workspace_namespace`
+  - `workspace_namespace.txt`
+  - `SOUL.md`
+  - `auth.lock`
+  - `.skills_prompt_snapshot.json`
+- Restore was verified by pre-seeding
+  `workspace-restore-user-20260615035803/.hermes/restore_probe.txt`; runtime
+  logs reported `Workspace restore complete (1 files)` and then
+  `Workspace save complete (6 files ...)`.
+- Latest short-window log query showed no new `Upload failed` lines.
+- Local validation passed with 30 pytest tests, deploy/teardown shell syntax,
+  whitespace check, and CDK TypeScript build.
+- Feishu progress document created:
+  `https://tezign.feishu.cn/docx/MqfLdKd82o3MdExUmntcEj9hnBg`
+
+Follow-up:
+
+- Current isolation is enforced at code level by stable user namespace and
+  same-container namespace refusal. IAM still grants the runtime role access to
+  the whole workspace bucket; stronger hard isolation would require scoped
+  session credentials or per-user prefix policies.

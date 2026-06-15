@@ -68,6 +68,66 @@ class RemoveBedrockModelInvokePolicyAspect implements IAspect {
   }
 }
 
+class AddWorkspaceS3PolicyAspect implements IAspect {
+  public constructor(
+    private readonly bucketName: string,
+    private readonly kmsKeyArn?: string,
+  ) {}
+
+  public visit(node: IConstruct): void {
+    if (!(node instanceof CfnPolicy)) {
+      return;
+    }
+    if (!node.node.path.includes('/Runtime/ExecutionRole/DefaultPolicy/')) {
+      return;
+    }
+
+    const document = Stack.of(node).resolve(node.policyDocument) as { Statement?: unknown };
+    const statements = Array.isArray(document.Statement) ? document.Statement : [];
+    const bucketArn = `arn:aws:s3:::${this.bucketName}`;
+    const objectArn = `${bucketArn}/*`;
+    const workspaceStatements = [
+      {
+        Effect: 'Allow',
+        Action: 's3:ListBucket',
+        Resource: bucketArn,
+      },
+      {
+        Effect: 'Allow',
+        Action: [
+          's3:GetObject',
+          's3:PutObject',
+          's3:DeleteObject',
+          's3:AbortMultipartUpload',
+          's3:ListMultipartUploadParts',
+        ],
+        Resource: objectArn,
+      },
+    ];
+
+    if (this.kmsKeyArn) {
+      workspaceStatements.push({
+        Effect: 'Allow',
+        Action: [
+          'kms:Decrypt',
+          'kms:DescribeKey',
+          'kms:Encrypt',
+          'kms:GenerateDataKey',
+          'kms:GenerateDataKeyWithoutPlaintext',
+          'kms:ReEncryptFrom',
+          'kms:ReEncryptTo',
+        ],
+        Resource: this.kmsKeyArn,
+      });
+    }
+
+    node.addPropertyOverride('PolicyDocument.Statement', [
+      ...statements,
+      ...workspaceStatements,
+    ]);
+  }
+}
+
 /**
  * CDK Stack that deploys AgentCore infrastructure.
  *
@@ -88,6 +148,11 @@ export class AgentCoreStack extends Stack {
       spec,
     });
     Aspects.of(this).add(new RemoveBedrockModelInvokePolicyAspect());
+    if (process.env.S3_BUCKET) {
+      Aspects.of(this).add(
+        new AddWorkspaceS3PolicyAspect(process.env.S3_BUCKET, process.env.WORKSPACE_KMS_KEY_ARN),
+      );
+    }
 
     // Create AgentCoreMcp if there are gateways configured
     if (mcpSpec?.agentCoreGateways && mcpSpec.agentCoreGateways.length > 0) {

@@ -100,6 +100,9 @@ class WorkspaceSync:
             return
 
         with self._save_lock:
+            self.workspace.mkdir(parents=True, exist_ok=True)
+            (self.workspace / ".workspace_namespace").write_text(namespace + "\n")
+            (self.workspace / "workspace_namespace.txt").write_text(namespace + "\n")
             prefix = f"{namespace}/.hermes/"
             count = 0
             s3 = self._s3_client()

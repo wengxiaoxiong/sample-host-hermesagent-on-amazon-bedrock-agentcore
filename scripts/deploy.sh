@@ -78,6 +78,28 @@ prepare_agentcore_env() {
     export LITELLM_MODEL="${LITELLM_MODEL:-${HERMES_MODEL:-${MODEL_NAME:-gpt-4o-mini}}}"
     export HERMES_MODEL="${HERMES_MODEL:-$LITELLM_MODEL}"
     export WARMUP_MODEL="${WARMUP_MODEL:-$LITELLM_MODEL}"
+    export AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || echo "us-east-1")}}"
+    export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-$AWS_REGION}"
+    local account
+    account="$(aws sts get-caller-identity --query Account --output text)"
+    export S3_BUCKET="${S3_BUCKET:-${PROJECT_NAME}-user-files-${account}-${AWS_REGION}}"
+    export WORKSPACE_KMS_KEY_ARN="${WORKSPACE_KMS_KEY_ARN:-$(aws s3api get-bucket-encryption \
+        --bucket "$S3_BUCKET" \
+        --region "$AWS_REGION" \
+        --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.KMSMasterKeyID' \
+        --output text 2>/dev/null || true)}"
+    if [ "$WORKSPACE_KMS_KEY_ARN" = "None" ]; then
+        export WORKSPACE_KMS_KEY_ARN=""
+    fi
+    export WORKSPACE_PATH="${WORKSPACE_PATH:-/mnt/workspace/.hermes}"
+    export WORKSPACE_SYNC_INTERVAL="${WORKSPACE_SYNC_INTERVAL:-$(python - <<'PY'
+import json
+from pathlib import Path
+
+config = json.loads(Path("cdk.json").read_text())
+print(config.get("context", {}).get("workspace_sync_interval_seconds", 300))
+PY
+)}"
 
     AGENTCORE_CONFIG_BACKUP="$(mktemp)"
     cp "$PROJECT_DIR/agentcore/agentcore.json" "$AGENTCORE_CONFIG_BACKUP"
@@ -99,10 +121,13 @@ config["runtimes"][0]["envVars"] = [
     {"name": "LITELLM_MODEL", "value": os.environ["LITELLM_MODEL"]},
     {"name": "HERMES_MODEL", "value": os.environ["HERMES_MODEL"]},
     {"name": "WARMUP_MODEL", "value": os.environ["WARMUP_MODEL"]},
+    {"name": "S3_BUCKET", "value": os.environ["S3_BUCKET"]},
+    {"name": "WORKSPACE_PATH", "value": os.environ["WORKSPACE_PATH"]},
+    {"name": "WORKSPACE_SYNC_INTERVAL", "value": os.environ["WORKSPACE_SYNC_INTERVAL"]},
 ]
 path.write_text(json.dumps(config, indent=2) + "\n")
 PY
-    info "Injected LiteLLM runtime envVars into agentcore/agentcore.json for this deployment."
+    info "Injected LiteLLM and workspace runtime envVars into agentcore/agentcore.json for this deployment."
 }
 
 ensure_hermes_agent_source() {

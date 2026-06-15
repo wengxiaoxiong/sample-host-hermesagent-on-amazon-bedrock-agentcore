@@ -404,3 +404,96 @@ Follow-up:
   same-container namespace refusal. IAM still grants the runtime role access to
   the whole workspace bucket; stronger hard isolation would require scoped
   session credentials or per-user prefix policies.
+
+## 2026-06-15 Cross-Session and Cross-User Workspace E2E
+
+Date: 2026-06-15 15:35-15:43 CST
+Operator: Codex
+AWS account: `873478945193`
+AWS region: `us-east-1`
+Runtime ARN:
+`arn:aws:bedrock-agentcore:us-east-1:873478945193:runtime/hermes_hermes-5ddzSXBy8T`
+Git branch: `codex/phase12-litellm-agentcore`
+
+Commands:
+
+```bash
+aws bedrock-agentcore invoke-agent-runtime \
+  --runtime-user-id e2e-fmcg-20260615153536 \
+  --runtime-session-id session-e2e-fmcg-20260615153536-a-0000000000000000000001 \
+  --payload '{"userId":"e2e-fmcg-20260615153536",...}'
+aws s3 cp \
+  s3://hermes-agentcore-user-files-873478945193-us-east-1/e2e-fmcg-20260615153536/.hermes/reports/fmcg_report_20260615153536.md -
+aws bedrock-agentcore stop-runtime-session \
+  --runtime-session-id session-e2e-fmcg-20260615153536-a-0000000000000000000001
+aws bedrock-agentcore invoke-agent-runtime \
+  --runtime-user-id e2e-fmcg-20260615153536 \
+  --runtime-session-id session-e2e-fmcg-20260615153536-b-0000000000000000000002 \
+  --payload '{"userId":"e2e-fmcg-20260615153536",...}'
+aws bedrock-agentcore invoke-agent-runtime \
+  --runtime-user-id e2e-beauty-20260615153536 \
+  --runtime-session-id session-e2e-beauty-20260615153536-a-0000000000000000000001 \
+  --payload '{"userId":"e2e-beauty-20260615153536",...}'
+aws bedrock-agentcore stop-runtime-session \
+  --runtime-session-id session-e2e-beauty-20260615153536-a-0000000000000000000001
+aws bedrock-agentcore stop-runtime-session \
+  --runtime-session-id session-e2e-fmcg-20260615153536-b-0000000000000000000002
+aws bedrock-agentcore invoke-agent-runtime \
+  --runtime-user-id e2e-beauty-20260615153536 \
+  --runtime-session-id session-e2e-beauty-20260615153536-b-0000000000000000000002 \
+  --payload '{"userId":"e2e-beauty-20260615153536",...}'
+aws bedrock-agentcore invoke-agent-runtime \
+  --runtime-user-id e2e-fmcg-20260615153536 \
+  --runtime-session-id session-e2e-fmcg-20260615153536-c-0000000000000000000003 \
+  --payload '{"userId":"e2e-fmcg-20260615153536",...}'
+aws logs filter-log-events \
+  --log-group-name /aws/bedrock-agentcore/runtimes/hermes_hermes-5ddzSXBy8T-DEFAULT \
+  --filter-pattern '"e2e-fmcg-20260615153536"'
+aws logs filter-log-events \
+  --log-group-name /aws/bedrock-agentcore/runtimes/hermes_hermes-5ddzSXBy8T-DEFAULT \
+  --filter-pattern '"e2e-beauty-20260615153536"'
+```
+
+Result:
+
+- Cross-session workspace restore/save passed for the FMCG user.
+- Cross-session workspace restore/save passed for the Beauty user.
+- Cross-user workspace isolation passed in both directions.
+- No `Workspace already initialized`, `Agent error`, or `Upload failed` log
+  entries were found in the validation window.
+
+Evidence:
+
+- FMCG Session A created
+  `e2e-fmcg-20260615153536/.hermes/reports/fmcg_report_20260615153536.md`
+  in S3. The first line was `FMCG_MARKER_20260615153536`.
+- FMCG Session A was stopped with `stop-runtime-session`; FMCG Session B then
+  restored the workspace and read back `FMCG_MARKER_20260615153536`.
+- Beauty Session A created
+  `e2e-beauty-20260615153536/.hermes/reports/beauty_report_20260615153536.md`
+  in S3. The first line was `BEAUTY_MARKER_20260615153536`.
+- Beauty Session A was stopped; Beauty Session B restored the workspace and
+  read back `BEAUTY_MARKER_20260615153536`.
+- Beauty Session B attempted to read the FMCG report path and returned
+  `ISOLATED_BEAUTY_CANNOT_READ_FMCG_20260615153536`.
+- FMCG Session C attempted to read the Beauty report path and returned
+  `ISOLATED_FMCG_CANNOT_READ_BEAUTY_20260615153536`.
+- S3 report listings were separated:
+  - FMCG prefix contains only `reports/fmcg_report_20260615153536.md`.
+  - Beauty prefix contains only `reports/beauty_report_20260615153536.md`.
+- S3 namespace markers matched the user prefixes:
+  - `e2e-fmcg-20260615153536/.hermes/workspace_namespace.txt`
+  - `e2e-beauty-20260615153536/.hermes/workspace_namespace.txt`
+- CloudWatch logs showed restore/init/save for both namespaces:
+  - `Restoring workspace from s3://.../e2e-fmcg-20260615153536/.hermes/`
+  - `Workspace save complete (... e2e-fmcg-20260615153536/.hermes/)`
+  - `Restoring workspace from s3://.../e2e-beauty-20260615153536/.hermes/`
+  - `Workspace save complete (... e2e-beauty-20260615153536/.hermes/)`
+
+Follow-up:
+
+- Functional cross-session and cross-user workspace validation is now passed.
+- The remaining hardening gap is unchanged: IAM still grants the runtime role
+  access to the whole workspace bucket. Code-level namespace isolation works;
+  stronger IAM-level user isolation still requires scoped session credentials
+  or per-user prefix policies.
